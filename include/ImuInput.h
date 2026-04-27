@@ -23,6 +23,17 @@ class ImuInput {
   // True once we've received at least one rotation-vector event.
   bool hasFix() const { return _hasFix; }
 
+  // Linear acceleration (m/s², gravity already subtracted by the BNO085's
+  // onboard sensor fusion), in the sensor's body frame.
+  float accelX() const { return _accelX; }
+  float accelY() const { return _accelY; }
+  float accelZ() const { return _accelZ; }
+  bool hasAccel() const { return _hasAccel; }
+
+  // Cumulative count of linear-acceleration events ever received. Use
+  // deltas between samples to verify the IMU is still streaming events.
+  uint32_t accelEventCount() const { return _accelEventCount; }
+
  private:
   static constexpr long REPORT_INTERVAL_US = 20000;  // 50 Hz
 
@@ -36,4 +47,9 @@ class ImuInput {
   float _pitch{0};
   float _roll{0};
   bool _hasFix{false};
+  float _accelX{0};
+  float _accelY{0};
+  float _accelZ{0};
+  bool _hasAccel{false};
+  uint32_t _accelEventCount{0};
 };

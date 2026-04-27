@@ -38,20 +38,36 @@ void ImuInput::update() {
   if (_bno08x.wasReset()) {
     enableReports();
   }
-  if (!_bno08x.getSensorEvent(&_sensorValue)) return;
-  if (_sensorValue.sensorId != SH2_ROTATION_VECTOR) return;
-
-  quaternionToEuler(_sensorValue.un.rotationVector.real,
-                    _sensorValue.un.rotationVector.i,
-                    _sensorValue.un.rotationVector.j,
-                    _sensorValue.un.rotationVector.k,
-                    _yaw, _pitch, _roll);
-  _hasFix = true;
+  // Drain all pending events: with both rotation vector and linear
+  // acceleration enabled at 50 Hz, the BNO085 produces ~100 events/s
+  // and processing only one per loop iteration would back up the queue.
+  while (_bno08x.getSensorEvent(&_sensorValue)) {
+    switch (_sensorValue.sensorId) {
+      case SH2_ROTATION_VECTOR:
+        quaternionToEuler(_sensorValue.un.rotationVector.real,
+                          _sensorValue.un.rotationVector.i,
+                          _sensorValue.un.rotationVector.j,
+                          _sensorValue.un.rotationVector.k,
+                          _yaw, _pitch, _roll);
+        _hasFix = true;
+        break;
+      case SH2_LINEAR_ACCELERATION:
+        _accelX = _sensorValue.un.linearAcceleration.x;
+        _accelY = _sensorValue.un.linearAcceleration.y;
+        _accelZ = _sensorValue.un.linearAcceleration.z;
+        _hasAccel = true;
+        _accelEventCount++;
+        break;
+    }
+  }
 }
 
 void ImuInput::enableReports() {
   if (!_bno08x.enableReport(SH2_ROTATION_VECTOR, REPORT_INTERVAL_US)) {
     Serial.println("ImuInput: could not enable rotation vector");
+  }
+  if (!_bno08x.enableReport(SH2_LINEAR_ACCELERATION, REPORT_INTERVAL_US)) {
+    Serial.println("ImuInput: could not enable linear acceleration");
   }
 }
 

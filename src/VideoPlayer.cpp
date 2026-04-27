@@ -81,6 +81,100 @@ bool VideoPlayer::begin(const char *path) {
   return true;
 }
 
+bool VideoPlayer::switchTo(const char *path) {
+  // Drain any in-flight DMA before tearing down the file/index — the DMA
+  // is still reading from _pixelBuf, but we're about to invalidate the
+  // file state that the next decode would have used.
+  _gfx.waitDMA();
+
+  // Open the new file first, before tearing down anything reusable, so a
+  // failed open leaves the current video playable.
+  File newFile = SD.open(path, FILE_READ);
+  if (!newFile) {
+    Serial.printf("VideoPlayer::switchTo: open '%s' failed\n", path);
+    return false;
+  }
+
+  uint8_t header[16];
+  if (newFile.read(header, sizeof(header)) != (int)sizeof(header) ||
+      memcmp(header, "MJP1", 4) != 0) {
+    Serial.printf("VideoPlayer::switchTo: bad header in '%s'\n", path);
+    newFile.close();
+    return false;
+  }
+
+  uint16_t newWidth   = uint16_t(header[4]) | (uint16_t(header[5]) << 8);
+  uint16_t newHeight  = uint16_t(header[6]) | (uint16_t(header[7]) << 8);
+  uint16_t newFps     = uint16_t(header[8]) | (uint16_t(header[9]) << 8);
+  uint32_t newFrameCount = uint32_t(header[12]) | (uint32_t(header[13]) << 8) |
+                           (uint32_t(header[14]) << 16) | (uint32_t(header[15]) << 24);
+
+  // Pixel buffer is sized for the original dimensions; refuse if the new
+  // video doesn't match. Reallocating it would be possible but isn't
+  // worth the complexity for this use case.
+  if (newWidth != _width || newHeight != _height) {
+    Serial.printf("VideoPlayer::switchTo: dimension mismatch %ux%u vs %ux%u\n",
+                  newWidth, newHeight, _width, _height);
+    newFile.close();
+    return false;
+  }
+  if (newFrameCount == 0) {
+    Serial.printf("VideoPlayer::switchTo: '%s' has no frames\n", path);
+    newFile.close();
+    return false;
+  }
+
+  // Allocate a new index and read it. Don't free the old one yet so we
+  // can fall back if anything below fails.
+  size_t indexBytes = size_t(newFrameCount) * sizeof(FrameLoc);
+  FrameLoc *newIndex = (FrameLoc *)ps_malloc(indexBytes);
+  if (!newIndex) {
+    Serial.printf("VideoPlayer::switchTo: index alloc failed (%u B)\n",
+                  (unsigned)indexBytes);
+    newFile.close();
+    return false;
+  }
+  if (newFile.read((uint8_t *)newIndex, indexBytes) != (int)indexBytes) {
+    Serial.println("VideoPlayer::switchTo: index read failed");
+    free(newIndex);
+    newFile.close();
+    return false;
+  }
+
+  // Find max compressed JPEG size; grow _jpegBuf if needed (never shrink).
+  uint32_t newMax = 0;
+  for (uint32_t i = 0; i < newFrameCount; i++) {
+    if (newIndex[i].size > newMax) newMax = newIndex[i].size;
+  }
+  if (newMax > _jpegBufSize) {
+    uint8_t *biggerBuf = (uint8_t *)ps_malloc(newMax);
+    if (!biggerBuf) {
+      Serial.printf("VideoPlayer::switchTo: jpeg regrow failed (%u B)\n", newMax);
+      free(newIndex);
+      newFile.close();
+      return false;
+    }
+    free(_jpegBuf);
+    _jpegBuf = biggerBuf;
+    _jpegBufSize = newMax;
+  }
+
+  // All allocations succeeded — commit the new state and release old.
+  if (_file) _file.close();
+  free(_index);
+
+  _file = newFile;
+  _index = newIndex;
+  _fps = newFps;
+  _frameCount = newFrameCount;
+  _requestedIdx = 0;
+  _displayedIdx = UINT32_MAX;  // force re-render
+
+  Serial.printf("VideoPlayer: switched to '%s' (%u frames, max JPEG %u B)\n",
+                path, _frameCount, newMax);
+  return true;
+}
+
 void VideoPlayer::seekToFrame(uint32_t idx) {
   if (_frameCount == 0) return;
   if (idx >= _frameCount) idx = _frameCount - 1;
@@ -93,6 +187,13 @@ void VideoPlayer::update() {
 
   uint32_t idx = _requestedIdx;  // snapshot — caller may change it again
   const FrameLoc &loc = _index[idx];
+
+  // Mark as attempted up front. If any read/decode step below fails
+  // (most likely cause: a JPEG corrupted by an upstream H.264 glitch
+  // during encoding), we want the user to be able to scrub past this
+  // frame instead of freezing here on every retry. The display retains
+  // the last successfully-rendered frame.
+  _displayedIdx = idx;
 
   // Wait for any in-flight DMA from the previous push to drain so we can
   // reuse _pixelBuf as the new decode target.
@@ -128,8 +229,6 @@ void VideoPlayer::update() {
   _gfx.startWrite();
   _gfx.pushImageDMA(0, 0, _width, _height, (lgfx::swap565_t *)_pixelBuf);
   _gfx.endWrite();
-
-  _displayedIdx = idx;
 }
 
 int VideoPlayer::drawCallback(JPEGDRAW *pDraw) {

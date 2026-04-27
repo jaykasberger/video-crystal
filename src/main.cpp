@@ -17,17 +17,45 @@ static constexpr int PIN_SD_MOSI  = 6;
 static constexpr int PIN_SD_MISO  = 4;
 static constexpr int PIN_SD_CS    = 7;
 
-static constexpr const char *VIDEO_PATH = "/video.mjp";
+// Three videos, selected by pitch:
+//   pitch >  PITCH_HIGH_DEG : video 1
+//   pitch in [LOW, HIGH]    : video 2
+//   pitch <  PITCH_LOW_DEG  : video 3
+// VIDEO_PATHS[0] is the "level/middle" video that gets loaded at startup.
+static constexpr const char *VIDEO_PATHS[3] = {
+  "/video-2.mjp",  // index 0: middle pose (level), shown first
+  "/video-1.mjp",  // index 1: tilted up
+  "/video-3.mjp",  // index 2: tilted down
+};
+static constexpr float PITCH_HIGH_DEG =   0.0f;
+static constexpr float PITCH_LOW_DEG  = -25.0f;
+static constexpr float PITCH_HYST_DEG =   3.0f;
 
-// Roll angle (radians) that maps to first/last frame. Roll past the
-// extents clamps. ±60° feels comfortable when holding the device.
-static constexpr float SCRUB_ROLL_RANGE_RAD = 60.0f * (PI / 180.0f);
+// --- Pitch-based scrub (active) --------------------------------------
+//
+// Tilt the device around its X axis (rocking the top edge toward or
+// away from you) to scrub through the video. Same shape of mapping as
+// the original roll-based control: ±RANGE → frame 0…N-1, level → middle.
+//
+// If the wrong sensor axis is being used, swap imu.pitch() in loop()
+// for imu.yaw() or imu.roll(). If direction is reversed, flip the sign
+// of `angle` at the call site.
+static constexpr float SCRUB_PITCH_RANGE_RAD = 90.0f * (PI / 180.0f);
+static constexpr float IMU_PITCH_OFFSET_RAD  = 0.0f;
 
-// The IMU is physically mounted rotated 90° clockwise in the roll axis,
-// so the sensor reads ~+90° when the device itself is level. Subtract
-// that constant so the *device's* roll, not the sensor's, drives the
-// scrub. If scrubbing ends up reversed, flip the sign here.
-static constexpr float IMU_ROLL_OFFSET_RAD = PI / 2.0f;
+// --- Translation-based scrub (commented out for fallback) ------------
+// Drove scrub from integrated lateral acceleration. Worked, but the
+// BNO085's onboard fusion would eventually decide our motion was noise
+// and stop reporting it (events kept flowing at 50 Hz with z=0 values),
+// freezing the scrub. Switched to rotation-based input instead.
+// static constexpr float    SCRUB_GAIN     = 60.0f;
+// static constexpr float    ACCEL_DEADBAND = 0.10f;  // m/s²
+// static constexpr float    REST_THRESHOLD = 0.15f;  // m/s²
+// static constexpr uint32_t REST_SAMPLES   = 30;
+
+// --- Roll-based scrub (kept commented out for fallback) --------------
+// static constexpr float SCRUB_ROLL_RANGE_RAD = 60.0f * (PI / 180.0f);
+// static constexpr float IMU_ROLL_OFFSET_RAD  = PI / 2.0f;
 
 LGFX gfx;
 VideoPlayer videoPlayer(gfx);
@@ -127,9 +155,11 @@ void setup() {
     while (true) delay(1000);
   }
 
-  if (!videoPlayer.begin(VIDEO_PATH)) {
-    Serial.printf("VideoPlayer: failed to open %s\n", VIDEO_PATH);
-    showFatal("video.mjp missing/invalid");
+  // Start with the middle/level video; pitch selector in loop() will
+  // switch among the three as the device tilts.
+  if (!videoPlayer.begin(VIDEO_PATHS[0])) {
+    Serial.printf("VideoPlayer: failed to open %s\n", VIDEO_PATHS[0]);
+    showFatal("video file missing/invalid");
     while (true) delay(1000);
   }
 
@@ -141,16 +171,61 @@ void setup() {
 void loop() {
   imu.update();
 
+  // --- Pitch-based video selection -------------------------------------
+  // Selects which of the three videos is active. PITCH_HYST_DEG
+  // prevents flicker at the boundaries: once you've entered a band you
+  // have to overshoot the threshold by HYST degrees to leave it.
+  // currentVideo holds an index into VIDEO_PATHS: 0=mid, 1=high, 2=low.
+  static int currentVideo = 0;
+  if (imu.hasFix()) {
+    float pitchDeg = -imu.pitch() * (180.0f / PI);
+    int target = currentVideo;
+    switch (currentVideo) {
+      case 1:  // currently "high"; need to drop past HIGH-HYST to leave
+        if (pitchDeg < PITCH_HIGH_DEG - PITCH_HYST_DEG) {
+          target = (pitchDeg < PITCH_LOW_DEG) ? 2 : 0;
+        }
+        break;
+      case 2:  // currently "low"; need to rise past LOW+HYST to leave
+        if (pitchDeg > PITCH_LOW_DEG + PITCH_HYST_DEG) {
+          target = (pitchDeg > PITCH_HIGH_DEG) ? 1 : 0;
+        }
+        break;
+      default:  // currently "mid"; cross full thresholds to leave
+        if (pitchDeg > PITCH_HIGH_DEG)      target = 1;
+        else if (pitchDeg < PITCH_LOW_DEG)  target = 2;
+        break;
+    }
+    if (target != currentVideo) {
+      if (videoPlayer.switchTo(VIDEO_PATHS[target])) {
+        currentVideo = target;
+      }
+    }
+  }
+
+  // --- Yaw-based scrub (active) ----------------------------------------
   if (imu.hasFix() && videoPlayer.frameCount() > 0) {
-    // Subtract the mounting offset so we work in device-frame roll, then
-    // map [-RANGE, +RANGE] → [0, frameCount-1]. Level → middle frame.
-    float roll = imu.roll() - IMU_ROLL_OFFSET_RAD;
-    float t = (roll + SCRUB_ROLL_RANGE_RAD) / (2.0f * SCRUB_ROLL_RANGE_RAD);
+    float angle = imu.yaw() - IMU_PITCH_OFFSET_RAD;
+    float t = (angle + SCRUB_PITCH_RANGE_RAD) / (2.0f * SCRUB_PITCH_RANGE_RAD);
     if (t < 0.0f) t = 0.0f;
     if (t > 1.0f) t = 1.0f;
     uint32_t target = (uint32_t)(t * (videoPlayer.frameCount() - 1));
     videoPlayer.seekToFrame(target);
   }
+
+  // --- Translation-based scrub (commented out for fallback) ------------
+  // See constants block above for why this was abandoned. The full body
+  // (with ZUPT, NaN sanitization, and 1-Hz scrub log) lived here.
+
+  // --- Roll-based scrub (kept commented out for fallback) --------------
+  // if (imu.hasFix() && videoPlayer.frameCount() > 0) {
+  //   float roll = imu.roll() - IMU_ROLL_OFFSET_RAD;
+  //   float t = (roll + SCRUB_ROLL_RANGE_RAD) / (2.0f * SCRUB_ROLL_RANGE_RAD);
+  //   if (t < 0.0f) t = 0.0f;
+  //   if (t > 1.0f) t = 1.0f;
+  //   uint32_t target = (uint32_t)(t * (videoPlayer.frameCount() - 1));
+  //   videoPlayer.seekToFrame(target);
+  // }
 
   videoPlayer.update();
 }

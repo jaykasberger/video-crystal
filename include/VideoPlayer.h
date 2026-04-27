@@ -26,6 +26,13 @@ class VideoPlayer {
   // Open `path`, read header + index into RAM, allocate buffers.
   bool begin(const char *path);
 
+  // Switch the active video file. Closes the current one, opens `path`,
+  // reads its header + index, and reuses (or grows) the existing buffers.
+  // All videos must share dimensions (width × height); if `path` reports
+  // different ones, this returns false and the previous video remains
+  // playable. Resets the requested/displayed frame indices.
+  bool switchTo(const char *path);
+
   // Request that frame `idx` be displayed. Clamped to [0, frameCount-1].
   // No-op if it's the same frame already showing. The actual SD read +
   // JPEG decode + DMA push happens in update(), so callers can update
