@@ -31,6 +31,12 @@ static constexpr float PITCH_HIGH_DEG =   0.0f;
 static constexpr float PITCH_LOW_DEG  = -25.0f;
 static constexpr float PITCH_HYST_DEG =   3.0f;
 
+// Backlight auto-off: if neither pitch nor yaw changes by more than
+// MOTION_THRESHOLD_RAD for BACKLIGHT_TIMEOUT_MS, drive PIN_BACKLIGHT
+// LOW. Any subsequent motion turns it back on.
+static constexpr float    MOTION_THRESHOLD_RAD = 2.0f * (PI / 180.0f);  // ~2°
+static constexpr uint32_t BACKLIGHT_TIMEOUT_MS = 30000;
+
 // --- Pitch-based scrub (active) --------------------------------------
 //
 // Tilt the device around its X axis (rocking the top edge toward or
@@ -171,6 +177,53 @@ void setup() {
 void loop() {
   imu.update();
 
+  // Yaw scrub state — declared at function scope so both the video
+  // selection block and the scrub block can touch it. The scrub block
+  // unwraps yaw across the BNO085's ±π wrap, accumulating cumulative
+  // rotation; the selection block resets it on a successful video
+  // switch so each new video starts at its middle frame.
+  static bool  yawInited     = false;
+  static float prevYaw       = 0.0f;
+  static float unwrappedYaw  = 0.0f;
+
+  // --- Backlight auto-off on inactivity --------------------------------
+  // Track a "reference" orientation that updates whenever the device
+  // moves enough; the timestamp of that update is our last-motion time.
+  // Comparing each sample to the *reference* (rather than the previous
+  // sample) means slow drift still eventually trips the threshold.
+  static bool   blInitialized = false;
+  static float  blRefPitch    = 0.0f;
+  static float  blRefYaw      = 0.0f;
+  static uint32_t blLastMotionMs = 0;
+  static bool   blOn          = true;
+  if (imu.hasFix()) {
+    if (!blInitialized) {
+      blRefPitch = imu.pitch();
+      blRefYaw   = imu.yaw();
+      blLastMotionMs = millis();
+      blInitialized = true;
+    }
+
+    float dPitch = imu.pitch() - blRefPitch;
+    float dYaw   = imu.yaw()   - blRefYaw;
+    // Yaw wraps at ±π — fold the difference into [-π, π].
+    if (dYaw >  PI) dYaw -= 2.0f * PI;
+    if (dYaw < -PI) dYaw += 2.0f * PI;
+
+    if (fabsf(dPitch) > MOTION_THRESHOLD_RAD ||
+        fabsf(dYaw)   > MOTION_THRESHOLD_RAD) {
+      blRefPitch = imu.pitch();
+      blRefYaw   = imu.yaw();
+      blLastMotionMs = millis();
+    }
+
+    bool shouldBeOn = (millis() - blLastMotionMs) < BACKLIGHT_TIMEOUT_MS;
+    if (shouldBeOn != blOn) {
+      digitalWrite(PIN_BACKLIGHT, shouldBeOn ? HIGH : LOW);
+      blOn = shouldBeOn;
+    }
+  }
+
   // --- Pitch-based video selection -------------------------------------
   // Selects which of the three videos is active. PITCH_HYST_DEG
   // prevents flicker at the boundaries: once you've entered a band you
@@ -199,16 +252,43 @@ void loop() {
     if (target != currentVideo) {
       if (videoPlayer.switchTo(VIDEO_PATHS[target])) {
         currentVideo = target;
+        // Anchor the scrub origin at the current yaw so the new video
+        // starts at its middle frame and dYaw = 0 on the next sample.
+        unwrappedYaw = 0.0f;
+        prevYaw      = imu.yaw();
       }
     }
   }
 
-  // --- Yaw-based scrub (active) ----------------------------------------
+  // --- Yaw-based scrub (active, looping) -------------------------------
+  // Continuous rotation accumulates into `unwrappedYaw` (handling the
+  // BNO085's ±π wrap), so the user can keep turning in one direction
+  // and the video loops past the start/end instead of clamping.
   if (imu.hasFix() && videoPlayer.frameCount() > 0) {
-    float angle = imu.yaw() - IMU_PITCH_OFFSET_RAD;
-    float t = (angle + SCRUB_PITCH_RANGE_RAD) / (2.0f * SCRUB_PITCH_RANGE_RAD);
-    if (t < 0.0f) t = 0.0f;
-    if (t > 1.0f) t = 1.0f;
+    float curYaw = imu.yaw();
+    if (!yawInited) {
+      prevYaw = curYaw;
+      unwrappedYaw = 0.0f;
+      yawInited = true;
+    } else {
+      float dYaw = curYaw - prevYaw;
+      if (dYaw >  PI) dYaw -= 2.0f * PI;
+      if (dYaw < -PI) dYaw += 2.0f * PI;
+      unwrappedYaw += dYaw;
+      prevYaw = curYaw;
+
+      // Fold unwrappedYaw back into [-RANGE, +RANGE] every iteration so
+      // it can't accumulate without bound over long sessions and erode
+      // float precision. A fold of 2*RANGE corresponds to one full loop
+      // of the video, so the visible frame is unchanged by the fold.
+      const float TWO_RANGE = 2.0f * SCRUB_PITCH_RANGE_RAD;
+      while (unwrappedYaw >  SCRUB_PITCH_RANGE_RAD) unwrappedYaw -= TWO_RANGE;
+      while (unwrappedYaw < -SCRUB_PITCH_RANGE_RAD) unwrappedYaw += TWO_RANGE;
+    }
+
+    float t = (unwrappedYaw + SCRUB_PITCH_RANGE_RAD) /
+              (2.0f * SCRUB_PITCH_RANGE_RAD);
+    t = t - floorf(t);  // wrap to [0, 1)
     uint32_t target = (uint32_t)(t * (videoPlayer.frameCount() - 1));
     videoPlayer.seekToFrame(target);
   }
@@ -227,5 +307,12 @@ void loop() {
   //   videoPlayer.seekToFrame(target);
   // }
 
-  videoPlayer.update();
+  // Skip the (expensive) SD read + JPEG decode + DMA push while the
+  // backlight is off — there's nothing to see, so no point paying the
+  // CPU/SD cost. seekToFrame() above keeps _requestedIdx current, so
+  // when the backlight comes back on the next update() call will decode
+  // and push the right frame.
+  if (blOn) {
+    videoPlayer.update();
+  }
 }
