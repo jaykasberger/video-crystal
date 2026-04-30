@@ -17,24 +17,34 @@ static constexpr int PIN_SD_MOSI  = 6;
 static constexpr int PIN_SD_MISO  = 4;
 static constexpr int PIN_SD_CS    = 7;
 
-// Three videos, selected by pitch:
-//   pitch >  PITCH_HIGH_DEG : video 1
-//   pitch in [LOW, HIGH]    : video 2
-//   pitch <  PITCH_LOW_DEG  : video 3
-// VIDEO_PATHS[0] is the "level/middle" video that gets loaded at startup.
-static constexpr const char *VIDEO_PATHS[3] = {
-  "/video-2.mjp",  // index 0: middle pose (level), shown first
-  "/video-1.mjp",  // index 1: tilted up
-  "/video-3.mjp",  // index 2: tilted down
-};
-static constexpr float PITCH_HIGH_DEG =   0.0f;
-static constexpr float PITCH_LOW_DEG  = -25.0f;
+// Three pitch-band slots populated from whatever .mjp files are on the SD
+// card root, sorted alphabetically:
+//   videoPaths[0] = level/middle pose (also the first file shown at boot)
+//   videoPaths[1] = tilted up   (pitch >  PITCH_HIGH_DEG)
+//   videoPaths[2] = tilted down (pitch <  PITCH_LOW_DEG)
+// If fewer than three .mjp files are present, the missing slots fall back
+// to videoPaths[0] so the pitch-switching logic always has a valid path
+// to pass to VideoPlayer::switchTo().
+static constexpr int  MAX_VIDEO_SLOTS  = 3;
+static constexpr int  MAX_PATH_LEN     = 64;
+static char videoPaths[MAX_VIDEO_SLOTS][MAX_PATH_LEN] = {{0}};
+static int  videoCount = 0;
+static constexpr float PITCH_HIGH_DEG =   20.0f;
+static constexpr float PITCH_LOW_DEG  = -20.0f;
 static constexpr float PITCH_HYST_DEG =   3.0f;
 
-// Backlight auto-off: if neither pitch nor yaw changes by more than
-// MOTION_THRESHOLD_RAD for BACKLIGHT_TIMEOUT_MS, drive PIN_BACKLIGHT
-// LOW. Any subsequent motion turns it back on.
-static constexpr float    MOTION_THRESHOLD_RAD = 2.0f * (PI / 180.0f);  // ~2°
+// Backlight auto-off: if neither pitch nor yaw changes by more than the
+// active motion threshold for BACKLIGHT_TIMEOUT_MS, drive PIN_BACKLIGHT
+// LOW. Subsequent motion turns it back on.
+//
+// Two thresholds, asymmetric on purpose:
+//   - STAY_AWAKE_RAD (~2°): used while the backlight is already on, so
+//     small deliberate adjustments keep the timer alive.
+//   - WAKE_RAD (~10°): used while the backlight is off, so ambient table
+//     vibration / handling bumps don't spuriously wake the device — only
+//     a real pickup motion crosses this.
+static constexpr float    STAY_AWAKE_RAD       =  2.0f * (PI / 180.0f);
+static constexpr float    WAKE_RAD             = 10.0f * (PI / 180.0f);
 static constexpr uint32_t BACKLIGHT_TIMEOUT_MS = 30000;
 
 // --- Pitch-based scrub (active) --------------------------------------
@@ -103,6 +113,75 @@ static void drawSDStatus(const char *msg, uint16_t color) {
   gfx.drawString(msg, 8, 220);
 }
 
+static bool hasMjpExtension(const char *name) {
+  size_t n = strlen(name);
+  if (n < 5) return false;  // need at least "x.mjp"
+  const char *e = name + n - 4;
+  return e[0] == '.'
+      && (e[1] == 'm' || e[1] == 'M')
+      && (e[2] == 'j' || e[2] == 'J')
+      && (e[3] == 'p' || e[3] == 'P');
+}
+
+// Scan SD root for .mjp files, sort alphabetically, copy up to
+// MAX_VIDEO_SLOTS into videoPaths[]. Empty slots fall back to slot 0.
+// Must be called after initSDCard() succeeds.
+static void discoverVideos() {
+  static constexpr int MAX_CANDIDATES = 16;
+  char candidates[MAX_CANDIDATES][MAX_PATH_LEN];
+  int n = 0;
+
+  File root = SD.open("/");
+  if (!root) {
+    Serial.println("discoverVideos: SD root open failed");
+    return;
+  }
+  for (File f = root.openNextFile(); f; f = root.openNextFile()) {
+    if (f.isDirectory()) { f.close(); continue; }
+    const char *name = f.name();
+    if (name[0] == '/') name++;            // some SD lib versions prefix "/"
+    if (name[0] == '.') { f.close(); continue; }  // skip hidden / "._" files
+    if (!hasMjpExtension(name)) { f.close(); continue; }
+    if (n < MAX_CANDIDATES) {
+      snprintf(candidates[n], MAX_PATH_LEN, "/%s", name);
+      n++;
+    } else {
+      Serial.printf("discoverVideos: ignoring extra .mjp '%s' (cap %d)\n",
+                    name, MAX_CANDIDATES);
+    }
+    f.close();
+  }
+  root.close();
+
+  // Insertion sort, case-insensitive — humans expect "1-foo.mjp" < "2-bar.mjp"
+  // regardless of how the FAT layer happens to capitalize the names.
+  for (int i = 1; i < n; i++) {
+    char tmp[MAX_PATH_LEN];
+    strncpy(tmp, candidates[i], MAX_PATH_LEN);
+    int j = i - 1;
+    while (j >= 0 && strcasecmp(candidates[j], tmp) > 0) {
+      strncpy(candidates[j + 1], candidates[j], MAX_PATH_LEN);
+      j--;
+    }
+    strncpy(candidates[j + 1], tmp, MAX_PATH_LEN);
+  }
+
+  videoCount = (n < MAX_VIDEO_SLOTS) ? n : MAX_VIDEO_SLOTS;
+  for (int i = 0; i < MAX_VIDEO_SLOTS; i++) {
+    int src = (i < videoCount) ? i : 0;  // missing slots reuse the first file
+    if (videoCount > 0) {
+      strncpy(videoPaths[i], candidates[src], MAX_PATH_LEN);
+    } else {
+      videoPaths[i][0] = '\0';
+    }
+  }
+
+  Serial.printf("discoverVideos: %d .mjp file(s) found\n", n);
+  for (int i = 0; i < videoCount; i++) {
+    Serial.printf("  slot[%d] = %s\n", i, videoPaths[i]);
+  }
+}
+
 static void initSDCard() {
   sdSpi.begin(PIN_SD_SCK, PIN_SD_MISO, PIN_SD_MOSI, PIN_SD_CS);
   if (!SD.begin(PIN_SD_CS, sdSpi, 25000000)) {
@@ -154,6 +233,7 @@ void setup() {
   gfx.setRotation(0);
 
   initSDCard();
+  discoverVideos();
 
   if (!imu.begin(Wire, 0x4B)) {
     Serial.println("IMU init failed");
@@ -161,10 +241,16 @@ void setup() {
     while (true) delay(1000);
   }
 
+  if (videoCount == 0) {
+    Serial.println("No .mjp files found on SD root");
+    showFatal("no .mjp on SD");
+    while (true) delay(1000);
+  }
+
   // Start with the middle/level video; pitch selector in loop() will
   // switch among the three as the device tilts.
-  if (!videoPlayer.begin(VIDEO_PATHS[0])) {
-    Serial.printf("VideoPlayer: failed to open %s\n", VIDEO_PATHS[0]);
+  if (!videoPlayer.begin(videoPaths[0])) {
+    Serial.printf("VideoPlayer: failed to open %s\n", videoPaths[0]);
     showFatal("video file missing/invalid");
     while (true) delay(1000);
   }
@@ -210,8 +296,8 @@ void loop() {
     if (dYaw >  PI) dYaw -= 2.0f * PI;
     if (dYaw < -PI) dYaw += 2.0f * PI;
 
-    if (fabsf(dPitch) > MOTION_THRESHOLD_RAD ||
-        fabsf(dYaw)   > MOTION_THRESHOLD_RAD) {
+    float threshold = blOn ? STAY_AWAKE_RAD : WAKE_RAD;
+    if (fabsf(dPitch) > threshold || fabsf(dYaw) > threshold) {
       blRefPitch = imu.pitch();
       blRefYaw   = imu.yaw();
       blLastMotionMs = millis();
@@ -250,7 +336,12 @@ void loop() {
         break;
     }
     if (target != currentVideo) {
-      if (videoPlayer.switchTo(VIDEO_PATHS[target])) {
+      // When fewer than 3 .mjp files are on the card, missing slots
+      // resolve to the same path as slot 0. Skip the (expensive)
+      // switchTo in that case — it would re-open and re-index the
+      // same file, causing a visible hitch.
+      bool samePath = strcmp(videoPaths[target], videoPaths[currentVideo]) == 0;
+      if (samePath || videoPlayer.switchTo(videoPaths[target])) {
         currentVideo = target;
         // Anchor the scrub origin at the current yaw so the new video
         // starts at its middle frame and dYaw = 0 on the next sample.

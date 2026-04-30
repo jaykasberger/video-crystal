@@ -138,8 +138,19 @@ Encode with [scripts/encode_video.sh](scripts/encode_video.sh):
 ./scripts/encode_video.sh input.mp4 video.mjp
 ```
 
-Then copy `video.mjp` to the SD card as `/video.mjp`. Override defaults
-via env vars: `WIDTH=240 HEIGHT=180 FPS=24 QUALITY=3 ROTATE=cw ...`.
+Then copy the encoded `.mjp` file(s) to the SD card root. Override
+encoder defaults via env vars: `WIDTH=240 HEIGHT=180 FPS=24 QUALITY=3
+ROTATE=cw ...`.
+
+At boot, [src/main.cpp](src/main.cpp) scans the SD root for `*.mjp`,
+sorts the matches alphabetically (case-insensitive), and assigns up to
+three to pitch-band slots: index 0 = level/middle (and the file shown
+at startup), index 1 = tilted up, index 2 = tilted down. Files past
+the third are ignored; if fewer than three are present, the missing
+slots fall back to slot 0 so the same video plays in those bands. So
+to put different content on individual devices, just rename the files
+with a sort prefix that puts the level/middle clip first
+(e.g. `1-level.mjp`, `2-up.mjp`, `3-down.mjp`).
 
 `QUALITY` is ffmpeg's `-q:v` (1 best/largest, 31 worst/smallest;
 5 is a sane default). The script letterboxes the source to preserve
